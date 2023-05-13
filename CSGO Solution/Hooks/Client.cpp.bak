@@ -1,0 +1,265 @@
+#include "../Hooks.hpp"
+#include "../Menu.hpp"
+#include "../Settings.hpp"
+#include "../Features/Packet/PacketManager.hpp"
+#include "../Features/Movement/Movement.hpp"
+#include "../Features/Prediction/EnginePrediction.hpp"
+#include "../Features/Animations/LagCompensation.hpp"
+#include "../Features/RageBot/RageBot.hpp"
+#include "../Features/RageBot/Autowall.hpp"
+#include "../Features/RageBot/Antiaim.hpp"
+#include "../Features/Networking/Networking.hpp"
+#include "../Features/Networking/Fakelag.hpp"
+#include "../Features/Animations/LocalAnimations.hpp"
+#include "../Features/Animations/Animations.hpp"
+#include "../Features/Visuals/World.hpp"
+#include "../Features/Weather/Weather.hpp"
+#include "../Features/Grenades/Warning.hpp"
+#include "../Features/Exploits/Exploits.hpp"
+#include "../Features/Visuals/Players.hpp"
+
+//p100 fix chams))))
+		/*note @dolbaeb
+		* - прикол в том что m_vecPlayerPatchEconIndices на оффсете потому что сигна послала нахуй, так что если перестанет работать пиздуем в ида - клиент длл
+		*/
+void ChamsFIX(ClientFrameStage_t Stage)
+{
+	if (Stage != ClientFrameStage_t::FRAME_RENDER_START)
+		return;
+
+	C_ChamsSettings aVisible = C_ChamsSettings();
+	C_ChamsSettings aInvisible = C_ChamsSettings();
+
+	aVisible = g_Settings->m_aChamsSettings[0];
+	aInvisible = g_Settings->m_aChamsSettings[1];
+
+	if (aVisible.m_bRenderChams || aInvisible.m_bRenderChams) {
+
+		for (int32_t iPlayerID = 1; iPlayerID <= g_Globals.m_Interfaces.m_GlobalVars->m_iMaxClients; iPlayerID++)
+		{
+			C_BasePlayer* pPlayer = C_BasePlayer::GetPlayerByIndex(iPlayerID);
+			if (!pPlayer || !pPlayer->IsPlayer() || !pPlayer->IsAlive() || pPlayer->m_iTeamNum() == g_Globals.m_LocalPlayer->m_iTeamNum())
+				continue;
+
+			for (size_t patchIndex = 0; patchIndex < 5; patchIndex++)
+			{
+				pPlayer->m_vecPlayerPatchEconIndices()[patchIndex] = Vector(0, 0, 0);
+			}
+		}
+	}
+}
+void __fastcall C_Hooks::hkFrameStageNotify( LPVOID pEcx, uint32_t, ClientFrameStage_t Stage )
+{
+	g_Globals.m_LocalPlayer = C_BasePlayer::GetPlayerByIndex( g_Globals.m_Interfaces.m_EngineClient->GetLocalPlayer( ) );
+	if ( !g_Globals.m_LocalPlayer )
+	{
+		g_LagCompensation->ResetData( );
+		g_Networking->ResetData( );
+		g_LocalAnimations->ResetData( );
+		g_PredictionSystem->ResetData( );
+		g_RageBot->ResetData( );
+		g_PlayerESP->ResetData( );
+		g_FakeLag->ResetData( );
+		g_WeatherSystem->ResetData( );
+
+		return g_Globals.m_Hooks.m_Originals.m_FrameStageNotify( Stage );
+	}
+
+	g_World->Instance( Stage );
+	g_LagCompensation->Instance( Stage );
+	g_AnimationSync->Instance( Stage );
+	g_RageBot->OnNetworkUpdate( Stage );
+
+	g_Networking->ProcessInterpolation( Stage, false );
+	g_Globals.m_Hooks.m_Originals.m_FrameStageNotify( Stage );
+	g_Networking->ProcessInterpolation( Stage, true );
+
+	if ( Stage == FRAME_NET_UPDATE_POSTDATAUPDATE_START )
+		g_PredictionSystem->AdjustViewmodelData( );
+
+	return g_World->PostFrame( Stage );
+}
+
+void __stdcall C_Hooks::hkCreateMove( int32_t iSequence, float_t flFrametime, bool bIsActive, bool& bSendPacket )
+{
+	g_Globals.m_Hooks.m_Originals.m_CreateMove( iSequence, flFrametime, bIsActive );
+	if ( !g_Globals.m_LocalPlayer || !g_Globals.m_LocalPlayer->IsAlive( ) || !g_PacketManager->SetupPacket( iSequence, &bSendPacket ) )
+		return g_Globals.m_Hooks.m_Originals.m_CreateMove( iSequence, flFrametime, bIsActive );
+
+	g_Globals.m_Packet.m_bInCreateMove = true;
+
+	g_ExploitSystem->SetupCommand( );
+	if ( g_Menu->IsMenuOpened( ) )
+		g_PacketManager->GetModifableCommand( )->m_nButtons &= ~( IN_ATTACK | IN_ATTACK2 | IN_RELOAD );
+
+	g_Globals.m_AccuracyData.m_bCanFire_Default = g_Globals.m_LocalPlayer->CanFire( );
+	g_Globals.m_AccuracyData.m_bCanFire_Shift = g_Globals.m_AccuracyData.m_bCanFire_Default;
+	if ( g_ExploitSystem->GetActiveExploit( ) == HIDESHOTS )
+		g_Globals.m_AccuracyData.m_bCanFire_Shift = g_Globals.m_LocalPlayer->CanFire( g_ExploitSystem->GetShiftAmount( ) );
+
+	g_PredictionSystem->UpdatePacket( );
+	g_PredictionSystem->SaveNetvars( g_PacketManager->GetModifableCommand( )->m_nCommand );
+
+	g_Movement->BunnyHop( );
+	g_Movement->MouseCorrection( );
+	g_Movement->AutoStrafe( );
+	g_Movement->FastStop( );
+
+	g_AntiAim->SlowWalk( );
+	g_AntiAim->JitterMove( );
+	g_AntiAim->Micromovement( );
+	g_AntiAim->LegMovement( );
+	
+	g_RageBot->BackupPlayers( );
+	g_AutoWall->CacheWeaponData( );
+	
+	g_RageBot->SetupPacket( );
+	if ( !g_ExploitSystem->PerformCommand( ) )
+	{
+		C_VerifiedUserCmd* pVerifiedCmd = g_Globals.m_Interfaces.m_Input->GetVerifiedCmd( iSequence );
+		if ( pVerifiedCmd )
+		{
+			pVerifiedCmd->m_Cmd = *g_PacketManager->GetModifableCommand( );
+			pVerifiedCmd->m_CRC = g_PacketManager->GetModifableCommand( )->GetChecksum( );
+		}
+
+		return;
+	}
+
+	g_RageBot->FakeDuck( );
+	g_RageBot->SaveMovementData( );
+	g_RageBot->PredictAutoStop( );
+	
+	g_PredictionSystem->Instance( );
+	
+	g_Movement->EdgeJump( );
+	g_RageBot->UpdatePeekState( );
+	g_GrenadePrediction->OnCreateMove( g_PacketManager->GetModifableCommand( ) );
+
+	g_FakeLag->Instance( );
+	g_RageBot->Instance( );
+	g_ExploitSystem->BreakLagCompensation( );
+	g_RageBot->ForceMovementData( );
+	g_ExploitSystem->Instance( );
+	g_AntiAim->Instance( );
+
+	return g_PacketManager->FinishPacket( iSequence );
+}
+
+static void WriteUsercmd( bf_write* pBuffer, C_UserCmd* pToCmd, C_UserCmd* pFromCmd )
+{
+	auto WriteCmd = g_Globals.m_AddressList.m_WriteUsercmd;
+	__asm
+	{
+		mov     ecx, pBuffer
+		mov     edx, pToCmd
+		push    pFromCmd
+		call    WriteCmd
+		add     esp, 4
+	}
+}
+
+bool __fastcall C_Hooks::hkWriteUsercmdDeltaToBuffer(LPVOID ecx, uint32_t, int32_t slot, bf_write* bufferWrite, int32_t from, int32_t to, bool is_new_commands)
+{
+	if (g_ExploitSystem->GetForcedShiftAmount() < 1 || g_ExploitSystem->GetShiftMode() != MODE::SHIFT_BUFFER)
+		return g_Globals.m_Hooks.m_Originals.m_WriteUsercmdDeltaToBuffer(ecx, slot, bufferWrite, from, to, is_new_commands);
+
+	// if (from != -1)
+		// return true;
+
+	//int32_t final_from = -1;
+
+	// uintptr_t frame_ptr;
+	// __asm mov frame_ptr, ebp;
+
+	// int32_t* backup_commands = reinterpret_cast <int32_t*> (frame_ptr + 0xFD8);
+	// int32_t* new_commands = reinterpret_cast <int32_t*> (frame_ptr + 0xFDC);
+
+	int32_t* backup_commands = (int32_t*)((uintptr_t)(bufferWrite)-0x30);
+	int32_t* new_commands = (int32_t*)((uintptr_t)(bufferWrite)-0x2C);
+
+	int32_t new_cmds = *new_commands;
+	int32_t shift_amount = g_ExploitSystem->GetForcedShiftAmount();
+
+	g_ExploitSystem->ResetShiftAmount();
+
+	*backup_commands = 0;
+
+	int32_t choked_modifier = new_cmds + shift_amount;
+
+	// if (choked_modifier > 62)
+		// choked_modifier = 62;
+
+	*new_commands = choked_modifier;
+
+	int32_t next_command = g_Globals.m_Interfaces.m_ClientState->m_nChokedCommands() + g_Globals.m_Interfaces.m_ClientState->m_nLastOutgoingCommand() + 1;
+	int32_t final_to = next_command - new_cmds + 1;
+
+	for (to = final_to; to <= next_command; to++)
+	{
+		if (!g_Globals.m_Hooks.m_Originals.m_WriteUsercmdDeltaToBuffer(ecx, slot, bufferWrite, from, to, true))
+			return false;
+
+		from = to;
+	}
+
+	/*if (final_to <= next_command)
+	{
+		while (g_Globals.m_Hooks.m_Originals.m_WriteUsercmdDeltaToBuffer(ecx, slot, bufferWrite, from, final_to, true))
+		{
+			from = final_to;
+
+			if (final_to > next_command)
+				goto next_cmd;
+		}
+
+		return false;
+	}*/
+
+	// next_cmd:
+
+	C_UserCmd* user_cmd = g_Globals.m_Interfaces.m_Input->GetUserCmd(slot, from);
+
+	if (!user_cmd)
+		return true;
+
+	C_UserCmd from_cmd = *user_cmd;
+	C_UserCmd to_cmd = *user_cmd;
+
+	// from_cmd = *user_cmd;
+	// to_cmd = from_cmd; // or user_cmd
+
+	to_cmd.m_nCommand++;
+	to_cmd.m_nTickCount += 200;
+
+	if (new_cmds > choked_modifier)
+		return true;
+
+	for (int32_t i = choked_modifier - new_cmds + 1; i > 0; --i)
+	{
+		WriteUsercmd(bufferWrite, &to_cmd, &from_cmd);
+
+		//from_cmd = to_cmd;
+		to_cmd.m_nCommand++;
+		to_cmd.m_nTickCount++;
+
+		from_cmd.m_nTickCount = to_cmd.m_nTickCount - 1;
+		from_cmd.m_nCommand = to_cmd.m_nCommand - 1;
+	}
+
+	return true;
+}
+__declspec( naked ) void __stdcall C_Hooks::hkCreateMove_Proxy( int32_t iSequence, float_t flFrameTime, bool bIsActive )
+{
+	__asm
+	{
+		push ebx
+		push esp
+		push dword ptr[ esp + 20 ]
+		push dword ptr[ esp + 0Ch + 8 ]
+		push dword ptr[ esp + 10h + 4 ]
+		call hkCreateMove
+		pop ebx
+		retn 0Ch
+	}
+}
